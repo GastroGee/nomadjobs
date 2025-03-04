@@ -1,0 +1,134 @@
+job "grafana" {
+  datacenters = ["dc1"]
+
+  type = "service"
+
+  group "grafana" {
+    count = 1
+    restart {
+      attempts = 10
+      interval = "5m"
+      delay    = "10s"
+      mode     = "delay"
+    }
+    network {
+      port "http" {
+        static = "3000"
+      }
+    }
+    service {
+      name = "grafana"
+      port = "http"
+      check {
+        name     = "Grafana HTTP"
+        type     = "http"
+        path     = "/api/health"
+        interval = "5s"
+        timeout  = "2s"
+        check_restart {
+          limit           = 2
+          grace           = "60s"
+          ignore_warnings = false
+        }
+      }
+    }
+    task "grafana" {
+      driver = "docker"
+
+      config {
+        image = "grafana/grafana:latest"
+
+        ports = ["http"]
+      }
+
+      resources {
+        cpu    = 200 # 500 MHz
+        memory = 256 # 256MB
+      }
+    }
+    task "nomad_follower" {
+      driver = "docker"
+      env {
+        VERBOSE           = 4
+        LOG_TAG           = "grafana"
+        LOG_FILE          = "${NOMAD_ALLOC_DIR}/nomad-logs.log"
+        NOMAD_ADDR        = "https://${attr.unique.hostname}:4646"
+        NOMAD_SKIP_VERIFY = true
+      }
+      config {
+        image = "sofixa/nomad_follower:latest"
+      }
+
+      resources {
+        cpu    = 100
+        memory = 512
+      }
+    }
+    task "alloy" {
+      driver = "docker"
+      config {
+        image = "grafana/alloy:latest"
+        args = [
+          "run",
+          "local/config.alloy",
+        ]
+      }
+      template {
+        data        = <<EOH
+          logging {
+              level = "debug"
+              format = "logfmt"
+          }
+          local.file_match "logs" {
+              path_targets = [{
+                  __address__ = "localhost",
+                  __path__    = "{{ env "NOMAD_ALLOC_DIR" }}//nomad-logs.log",
+                  job         = "nomad",
+              }]
+          }
+
+          loki.process "logs" {
+            forward_to = [loki.write.destination.receiver]
+            stage.json {
+              expressions = {
+                  alloc_id     = "alloc_id",
+                  data         = "data",
+                  job_meta     = "job_meta",
+                  job_name     = "job_name",
+                  message      = "message",
+                  node_name    = "node_name",
+                  service_name = "service_name",
+                  service_tags = "service_tags",                         
+                }
+              }
+              stage.labels {
+                  values = {
+                      timestamp    = null,
+                      job_name     = null,
+                      alloc_id     = null,
+                      node_name    = null,
+                  }
+                }
+              }
+              loki.source.file "logs" {
+                  targets               = local.file_match.logs.targets
+                  forward_to            = [loki.process.logs.receiver]
+                  legacy_positions_file = "local/positions.yaml"
+              }
+
+              loki.write "destination" {
+                endpoint {
+                    url = "http://loki:3100"
+                }
+              }
+
+              EOH
+        destination = "local/config.alloy"
+      }
+      resources {
+        cpu    = 100
+        memory = 512
+      }
+    }
+  }
+}
